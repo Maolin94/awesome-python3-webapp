@@ -16,7 +16,7 @@ async def create_pool(loop, **kw):
         user=kw['user'],
         password=kw['password'],
         db=kw['db'],
-        charset=kw.get('charset', 'utf-8'),
+        charset=kw.get('charset', 'utf8'),  #此处为utf8，而非utf-8
         autocommit=kw.get('autocommit', True),
         maxsize=kw.get('maxsize', 10),
         minsize=kw.get('minsize', 1),
@@ -28,30 +28,26 @@ async def create_pool(loop, **kw):
 async def select(sql, args, size=None):  
     log(sql, args)
     global __pool
-    async with __pool.get() as conn:  #建立与数据库的连接
-        async with conn.cursor(aiomysql.DictCursor) as cur:  #获取游标对象
-            await cur.execute(sql.replace('?', '%s'), args or ())
-            if size:
-                rs = await cur.fetchmany(size)
-            else:
-                rs = await cur.fetchall()
+    with (await __pool) as conn:  #建立与数据库的连接
+        cur = await conn.cursor(aiomysql.DictCursor)  #获取游标对象
+        await cur.execute(sql.replace('?', '%s'), args or ())
+        if size:
+            rs = await cur.fetchmany(size)
+        else:
+            rs = await cur.fetchall()
+        await cur.close()
         logging.info('rows returned: %s' % len(rs))
         return rs
 
-async def execute(sql, args, autocommit=True):
+async def execute(sql, args):
     log(sql)
-    async with __pool.get() as conn:
-        if not autocommit:
-            await conn.begin()
+    with (await __pool) as conn:
         try:
-            async with conn.cursor(aiomysql.DictCursor) as cur:
-                await cur.execute(sql.replace('?', '%s'), args)
-                affected = cur.rowcount
-            if not autocommit:
-                await conn.commit()
+            cur = await conn.cursor()
+            await cur.execute(sql.replace('?', '%s'), args)
+            affected = cur.rowcount
+            await cur.close()
         except BaseException as e:
-            if not autocommit:
-                await conn.roolback()
             raise
         return affected
 
@@ -59,7 +55,7 @@ def create_args_string(num):
     L = []
     for _ in range(num):
         L.append('?')
-    return ','.join(L)
+    return ', '.join(L)
 
 #定义字段父类，保存字段名、字段类型、主键、缺省
 class Field():
@@ -128,15 +124,15 @@ class ModelMetaclass(type):
             raise Exception('Primary key not found.')
         for k in mappings.keys():
             attrs.pop(k)
-        escaped_fields = list(map(lambda f: '‘%s’' % f, fields))
+        escaped_fields = list(map(lambda f: '`%s`' % f, fields))
         attrs['__mappings__'] = mappings
         attrs['__table__'] = tableName
         attrs['__primary_key__'] = primaryKey
         attrs['__fields__'] = fields
-        attrs['__select__'] = 'select ‘%s’, %s from ‘%s’' %(primaryKey, ','.join(escaped_fields), tableName)
-        attrs['__insert__'] = 'insert into ‘%s’ (%s, ‘%s’) values (%s)' %(tableName, ','.join(escaped_fields), primaryKey, create_args_string(len(escaped_fields) +1))
-        attrs['__update__'] = 'update ‘%s’ set %s where ‘%s’=?' % (tableName, ','.join(map(lambda f: '‘%s’=?' %(mappings.get(f).name or f), fields)), primaryKey)
-        attrs['__delete__'] = 'delete from ‘%s’ where ‘%s’=?' %(tableName, primaryKey)
+        attrs['__select__'] = 'select `%s`, %s from `%s`' % (primaryKey, ', '.join(escaped_fields), tableName)
+        attrs['__insert__'] = 'insert into `%s` (%s, `%s`) values (%s)' % (tableName, ', '.join(escaped_fields), primaryKey, create_args_string(len(escaped_fields) +1))
+        attrs['__update__'] = 'update `%s` set %s where `%s`=?' % (tableName, ', '.join(map(lambda f: '`%s`=?' %(mappings.get(f).name or f), fields)), primaryKey)
+        attrs['__delete__'] = 'delete from `%s` where `%s`=?' % (tableName, primaryKey)
         return type.__new__(cls, name, bases, attrs)
 
 #定义模板类
@@ -154,6 +150,9 @@ class Model(dict, metaclass=ModelMetaclass):
     def __setattr__(self, key, value):
         self[key] = value
 
+    def getValue(self, key):
+        return getattr(self, key, None)
+
     def getValueOrDefault(self, key):
         value = getattr(self, key, None)
         if value is None:
@@ -170,6 +169,9 @@ class Model(dict, metaclass=ModelMetaclass):
         sql = [cls.__select__]
         if args is None:
             args = []
+        if where:
+            sql.append('where')
+            sql.append(where)
         orderBy = kw.get('orderBy', None)
         if orderBy:
             sql.append('order by')
@@ -191,7 +193,7 @@ class Model(dict, metaclass=ModelMetaclass):
     @classmethod
     async def findNumber(cls, selectField, where=None, args=None):
         'find number by select and where.'
-        sql = ['select %s _num_ from ‘%s’' %(selectField, cls.__table__)]
+        sql = ['select %s _num_ from `%s`' %(selectField, cls.__table__)]
         if where:
             sql.append('where')
             sql.append(where)
@@ -203,7 +205,7 @@ class Model(dict, metaclass=ModelMetaclass):
     @classmethod
     async def find(cls, pk):
         'find object by primary key.'
-        rs = await select('%s where ‘%s’=?' % (cls.__select__, cls.__primary_key__), [pk], 1)
+        rs = await select('%s where `%s`=?' % (cls.__select__, cls.__primary_key__), [pk], 1)
         if len(rs)==0:
             return None
         return cls(**rs[0])   #没看明白
@@ -213,7 +215,7 @@ class Model(dict, metaclass=ModelMetaclass):
         args.append(self.getValueOrDefault(self.__primary_key__))
         rows = await execute(self.__insert__, args)
         if rows != 1:
-            logging.warn('failed to uinsert record: affected rows: %s' % rows)
+            logging.warn('failed to insert record: affected rows: %s' % rows)
 
     async def update(self):
         args = list(map(self.getValue, self.__fields__))
@@ -228,11 +230,4 @@ class Model(dict, metaclass=ModelMetaclass):
         if rows != 1:
             logging.warn('failed to remove by primary key: affected rows: %s' % rows)
 
-if __name__ == "__main__":
-    class User(Model):
-        __table__ = 'users'
-        id = IntegerField(primary_key=True)
-        name = SrtingField()
-
-    user = User(id=123, name='Kevinlin')
-    await user.save()    
+  
